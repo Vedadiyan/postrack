@@ -95,10 +95,6 @@ func (conn *Conn) Listen(ctx context.Context, publicationId string, tables []str
 	if err != nil {
 		return err
 	}
-	publications := make([]string, 0)
-	for _, item := range tables {
-		publications = append(publications, fmt.Sprintf("publication_%s", item))
-	}
 	err = pglogrepl.StartReplication(
 		ctx,
 		conn.cn,
@@ -107,7 +103,7 @@ func (conn *Conn) Listen(ctx context.Context, publicationId string, tables []str
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '2'",
-				fmt.Sprintf("publication_names '%s'", strings.Join(publications, ",")),
+				fmt.Sprintf("publication_names 'publication_%s'", publicationId),
 			},
 		},
 	)
@@ -191,7 +187,7 @@ func (conn *Conn) Listen(ctx context.Context, publicationId string, tables []str
 
 func main() {
 	conn := New("192.168.107.107", "root", "toor", "test")
-	err := conn.Listen(context.TODO(), "xxxxx", []string{"test", "t"}, []Event{INSERT, UPDATE, DELETE, TRUNCATE}, 0, func(lsn pglogrepl.LSN, table string, event Event, newValue map[string]string, oldValue map[string]string) {
+	err := conn.Listen(context.TODO(), "xxxxx", []string{"test"}, []Event{INSERT, UPDATE, DELETE, TRUNCATE}, 0, func(lsn pglogrepl.LSN, table string, event Event, newValue map[string]string, oldValue map[string]string) {
 		fmt.Println(table, event, newValue, oldValue)
 	})
 	if err != nil {
