@@ -69,7 +69,7 @@ func (conn *Conn) configure(ctx context.Context, publicationId string, tables []
 	if err != nil {
 		return err
 	}
-	_, err = conn.cn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION publication_%s FOR TABLE %s;", publicationId, strings.Join(tables, fmt.Sprintf(" WITH (publish = '%s'),", strings.Join(_events, ","))))).ReadAll()
+	_, err = conn.cn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION publication_%s FOR TABLE %s WITH (publish = '%s');", publicationId, strings.Join(tables, ","), strings.Join(_events, ","))).ReadAll()
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func (conn *Conn) Listen(ctx context.Context, publicationId string, tables []str
 	err = pglogrepl.StartReplication(
 		ctx,
 		conn.cn,
-		fmt.Sprintf("publication_%s_slot", conn.database),
+		publicationId,
 		startLSN+1,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
@@ -191,7 +191,7 @@ func (conn *Conn) Listen(ctx context.Context, publicationId string, tables []str
 
 func main() {
 	conn := New("192.168.107.107", "root", "toor", "test")
-	err := conn.Listen(context.TODO(), "test2", []string{"test"}, []Event{INSERT, UPDATE, DELETE, TRUNCATE}, 0, func(lsn pglogrepl.LSN, table string, event Event, newValue map[string]string, oldValue map[string]string) {
+	err := conn.Listen(context.TODO(), "xxxxx", []string{"test", "t"}, []Event{INSERT, UPDATE, DELETE, TRUNCATE}, 0, func(lsn pglogrepl.LSN, table string, event Event, newValue map[string]string, oldValue map[string]string) {
 		fmt.Println(table, event, newValue, oldValue)
 	})
 	if err != nil {
