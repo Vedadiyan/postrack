@@ -184,7 +184,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	err = conn.Listen(context.TODO(), "test", 0, func(lsn pglogrepl.LSN, event Event, newValue, oldValue map[string]string) {
+	err = conn.Listen(context.TODO(), "test", 0, func(lsn pglogrepl.LSN, event Event, newValue map[string]string, oldValue map[string]string) {
 		fmt.Println(event, newValue, oldValue)
 	})
 	if err != nil {
