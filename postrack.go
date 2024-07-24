@@ -50,7 +50,7 @@ func New(host string, username string, password string, database string, opts ..
 	return conn
 }
 
-func (conn *Conn) Connect(ctx context.Context) error {
+func (conn *Conn) connect(ctx context.Context) error {
 	cn, err := pgconn.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", conn.user, conn.password, conn.host, conn.port, conn.database))
 	if err != nil {
 		return err
@@ -59,7 +59,7 @@ func (conn *Conn) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (conn *Conn) Configure(ctx context.Context, table string, events []Event) error {
+func (conn *Conn) configure(ctx context.Context, table string, events []Event) error {
 	_events := make([]string, 0)
 	for _, event := range events {
 		_events = append(_events, string(event))
@@ -86,8 +86,16 @@ func (conn *Conn) Configure(ctx context.Context, table string, events []Event) e
 	return nil
 }
 
-func (conn *Conn) Listen(ctx context.Context, table string, startLSN pglogrepl.LSN, cb func(pglogrepl.LSN, Event, map[string]string, map[string]string)) error {
-	err := pglogrepl.StartReplication(
+func (conn *Conn) Listen(ctx context.Context, table string, events []Event, startLSN pglogrepl.LSN, cb func(pglogrepl.LSN, Event, map[string]string, map[string]string)) error {
+	err := conn.connect(ctx)
+	if err != nil {
+		return err
+	}
+	err = conn.configure(ctx, table, events)
+	if err != nil {
+		return err
+	}
+	err = pglogrepl.StartReplication(
 		ctx,
 		conn.cn,
 		fmt.Sprintf("publication_%s_slot", table),
@@ -176,15 +184,8 @@ func (conn *Conn) Listen(ctx context.Context, table string, startLSN pglogrepl.L
 
 func main() {
 	conn := New("192.168.107.107", "root", "toor", "test")
-	err := conn.Connect(context.TODO())
-	if err != nil {
-		panic(err)
-	}
-	err = conn.Configure(context.TODO(), "test", []Event{INSERT, UPDATE, DELETE, TRUNCATE})
-	if err != nil {
-		panic(err)
-	}
-	err = conn.Listen(context.TODO(), "test", 0, func(lsn pglogrepl.LSN, event Event, newValue map[string]string, oldValue map[string]string) {
+
+	err := conn.Listen(context.TODO(), "test", []Event{INSERT, UPDATE, DELETE, TRUNCATE}, 0, func(lsn pglogrepl.LSN, event Event, newValue map[string]string, oldValue map[string]string) {
 		fmt.Println(event, newValue, oldValue)
 	})
 	if err != nil {
