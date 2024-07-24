@@ -91,7 +91,7 @@ func (conn *Conn) Listen(ctx context.Context, table string, startLSN pglogrepl.L
 		ctx,
 		conn.cn,
 		fmt.Sprintf("publication_%s_slot", table),
-		startLSN,
+		startLSN+1,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '2'",
