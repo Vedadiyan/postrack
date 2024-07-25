@@ -1,4 +1,4 @@
-package main
+package postrack
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type (
@@ -18,10 +19,19 @@ type (
 		user     string
 		password string
 		database string
-		cn       *pgconn.PgConn
+		replcn   *pgconn.PgConn
+		cn       *pgxpool.Pool
+		slot     string
+		events   []Event
 	}
-
-	ConnOption func(*Conn)
+	Table struct {
+		Name      string
+		Condition string
+		Override  bool
+	}
+	ConnOption  func(*Conn)
+	TableOption func(*Table)
+	HandleFunc  func(pglogrepl.LSN, string, Event, map[string]string, map[string]string)
 )
 
 const (
@@ -37,6 +47,28 @@ func WithPort(port int) ConnOption {
 	}
 }
 
+func WithSelector(fields ...string) TableOption {
+	return func(t *Table) {
+		t.Condition = fmt.Sprintf("(%s)", strings.Join(fields, ","))
+	}
+}
+
+func WithCondition(query string) TableOption {
+	return func(t *Table) {
+		t.Condition = fmt.Sprintf("WHERE %s", query)
+	}
+}
+
+func WithOverride() TableOption {
+	return func(t *Table) {
+		t.Override = true
+	}
+}
+
+func CreatePublicationId(name string) string {
+	return fmt.Sprintf("publication_%s", name)
+}
+
 func New(host string, username string, password string, database string, opts ...ConnOption) *Conn {
 	conn := new(Conn)
 	conn.port = 5432
@@ -50,149 +82,316 @@ func New(host string, username string, password string, database string, opts ..
 	return conn
 }
 
+func NewTable(name string, opts ...TableOption) *Table {
+	table := new(Table)
+	table.Name = name
+	for _, opt := range opts {
+		opt(table)
+	}
+	return table
+}
+
 func (conn *Conn) connect(ctx context.Context) error {
-	cn, err := pgconn.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", conn.user, conn.password, conn.host, conn.port, conn.database))
+	replcn, err := pgconn.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", conn.user, conn.password, conn.host, conn.port, conn.database))
 	if err != nil {
 		return err
 	}
-	conn.cn = cn
+	conn.replcn = replcn
+	config, err := pgxpool.ParseConfig(fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", conn.host, conn.port, conn.user, conn.password, conn.database))
+	if err != nil {
+		return err
+	}
+	config.MaxConns = 5
+	config.MinConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return err
+	}
+	conn.cn = pool
 	return nil
 }
 
-func (conn *Conn) configure(ctx context.Context, publicationId string, tables []string, events []Event) error {
+func (conn *Conn) PublicationExists(ctx context.Context, publicationId string) (bool, error) {
+	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_publication WHERE pubname = $1`, publicationId)
+	if err != nil {
+		return false, err
+	}
+	defer res.Close()
+	if res.Next() {
+		values, err := res.Values()
+		if err != nil {
+			return false, err
+		}
+		if len(values) == 0 {
+			return false, fmt.Errorf("row contains no result")
+		}
+		result, ok := values[0].(bool)
+		if !ok {
+			return false, fmt.Errorf("expected boolean but found %T", values[0])
+		}
+		return result, nil
+	}
+	return false, nil
+}
+
+func (conn *Conn) PublicationTableExists(ctx context.Context, publicationId string, table string) (bool, error) {
+	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_publication_tables WHERE pubname = $1 AND tablename = $2;`, publicationId, table)
+	if err != nil {
+		return false, err
+	}
+	defer res.Close()
+	if res.Next() {
+		values, err := res.Values()
+		if err != nil {
+			return false, err
+		}
+		if len(values) == 0 {
+			return false, fmt.Errorf("row contains no result")
+		}
+		result, ok := values[0].(bool)
+		if !ok {
+			return false, fmt.Errorf("expected boolean but found %T", values[0])
+		}
+		return result, nil
+	}
+	return false, nil
+}
+
+func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, error) {
+	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_replication_slots WHERE slot_name = $1;`, publicationId)
+	if err != nil {
+		return false, err
+	}
+	defer res.Close()
+	if res.Next() {
+		values, err := res.Values()
+		if err != nil {
+			return false, err
+		}
+		if len(values) == 0 {
+			return false, fmt.Errorf("row contains no result")
+		}
+		result, ok := values[0].(bool)
+		if !ok {
+			return false, fmt.Errorf("expected boolean but found %T", values[0])
+		}
+		return result, nil
+	}
+	return false, nil
+}
+
+func (conn *Conn) SetPublication(ctx context.Context, table *Table) error {
+	id := CreatePublicationId(conn.slot)
+	exists, err := conn.PublicationExists(ctx, id)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return conn.AlterPublication(ctx, table, table.Override)
+	}
+	return conn.AddPublication(ctx, table)
+}
+
+func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
+	id := CreatePublicationId(conn.slot)
 	_events := make([]string, 0)
-	for _, event := range events {
+	for _, event := range conn.events {
 		_events = append(_events, string(event))
 	}
+	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, table.Name, table.Condition, strings.Join(_events, ","))).ReadAll()
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
-	_, err := conn.cn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS publication_%s;", publicationId)).ReadAll()
+func (conn *Conn) AlterPublication(ctx context.Context, table *Table, override bool) error {
+	id := CreatePublicationId(conn.slot)
+	exists, err := conn.PublicationTableExists(ctx, id, table.Name)
 	if err != nil {
 		return err
 	}
-	_, err = conn.cn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION publication_%s FOR TABLE %s WITH (publish = '%s');", publicationId, strings.Join(tables, ","), strings.Join(_events, ","))).ReadAll()
-	if err != nil {
-		return err
-	}
-	_, err = pglogrepl.CreateReplicationSlot(ctx, conn.cn, publicationId, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
-	if err != nil {
-		pgError, ok := err.(*pgconn.PgError)
-		if !ok {
+	if exists {
+		if !override {
+			return nil
+		}
+		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", id, table.Name)).ReadAll()
+		if err != nil {
 			return err
 		}
-		if pgError.Code != "42710" {
+	}
+	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", id, table.Name)).ReadAll()
+	if err != nil {
+		return err
+	}
+	if len(table.Condition) != 0 {
+		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s SET TABLE %s %s", id, table.Name, table.Condition)).ReadAll()
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (conn *Conn) Listen(ctx context.Context, publicationId string, tables []string, events []Event, startLSN pglogrepl.LSN, cb func(pglogrepl.LSN, string, Event, map[string]string, map[string]string)) error {
-	err := conn.connect(ctx)
+func (conn *Conn) DropPublication(ctx context.Context, table *Table) error {
+	id := CreatePublicationId(conn.slot)
+	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", id)).ReadAll()
 	if err != nil {
 		return err
 	}
-	err = conn.configure(ctx, publicationId, tables, events)
+	return nil
+}
+
+func (conn *Conn) ReplacePublication(ctx context.Context, table *Table) error {
+	err := conn.DropPublication(ctx, table)
 	if err != nil {
 		return err
 	}
-	err = pglogrepl.StartReplication(
+	return conn.AddPublication(ctx, table)
+}
+
+func (conn *Conn) SetSlot(ctx context.Context, slot string) error {
+	exists, err := conn.SlotExists(ctx, slot)
+	if err != nil {
+		return err
+	}
+	if exists {
+		conn.slot = slot
+		return nil
+	}
+	return conn.AddSlot(ctx, slot)
+}
+
+func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
+	conn.slot = slot
+	_, err := pglogrepl.CreateReplicationSlot(ctx, conn.replcn, slot, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (conn *Conn) DropSlot(ctx context.Context, slot string) error {
+	err := pglogrepl.DropReplicationSlot(ctx, conn.replcn, slot, pglogrepl.DropReplicationSlotOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
+	id := CreatePublicationId(conn.slot)
+	err := pglogrepl.StartReplication(
 		ctx,
-		conn.cn,
-		publicationId,
-		startLSN+1,
+		conn.replcn,
+		conn.slot,
+		lsn+1,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '2'",
-				fmt.Sprintf("publication_names 'publication_%s'", publicationId),
+				fmt.Sprintf("publication_names '%s'", id),
 			},
 		},
 	)
 	if err != nil {
 		return err
 	}
-	go func() {
-		tables := make(map[uint32]string)
-		columns := make(map[uint32][]string)
-		for ctx.Err() == nil {
-			msg, err := conn.cn.ReceiveMessage(ctx)
-			if err != nil {
-				if pgconn.Timeout(err) {
-					continue
-				}
-				break
-			}
-			copyMsg, ok := msg.(*pgproto3.CopyData)
-			if !ok {
-				continue
-			}
-			if copyMsg.Data[0] != pglogrepl.XLogDataByteID {
-				continue
-			}
-			walLog, err := pglogrepl.ParseXLogData(copyMsg.Data[1:])
-			if err != nil {
-				continue
-			}
-			data, err := pglogrepl.Parse(walLog.WALData)
-			if err != nil {
-				continue
-			}
-			lsn := walLog.WALStart
-
-			switch data := data.(type) {
-			case *pglogrepl.RelationMessage:
-				{
-					tables[data.RelationID] = data.RelationName
-					columns[data.RelationID] = make([]string, 0)
-					for _, column := range data.Columns {
-						columns[data.RelationID] = append(columns[data.RelationID], column.Name)
-					}
-				}
-			case *pglogrepl.InsertMessage:
-				{
-					newValue := make(map[string]string)
-					for index, column := range columns[data.RelationID] {
-						newValue[column] = string(data.Tuple.Columns[index].Data)
-					}
-					cb(lsn, tables[data.RelationID], INSERT, newValue, nil)
-				}
-			case *pglogrepl.UpdateMessage:
-				{
-					oldValue := make(map[string]string)
-					for index, column := range columns[data.RelationID] {
-						oldValue[column] = string(data.OldTuple.Columns[index].Data)
-					}
-					newValue := make(map[string]string)
-					for index, column := range columns[data.RelationID] {
-						newValue[column] = string(data.NewTuple.Columns[index].Data)
-					}
-					cb(lsn, tables[data.RelationID], UPDATE, newValue, oldValue)
-				}
-			case *pglogrepl.DeleteMessage:
-				{
-					oldValue := make(map[string]string)
-					for index, column := range columns[data.RelationID] {
-						oldValue[column] = string(data.OldTuple.Columns[index].Data)
-					}
-					cb(lsn, tables[data.RelationID], DELETE, nil, oldValue)
-				}
-			case *pglogrepl.TruncateMessage:
-				{
-					cb(lsn, tables[data.RelationNum], TRUNCATE, nil, nil)
-				}
-			}
-		}
-	}()
+	go conn.handler(ctx, handleFunc)
 	return nil
 }
 
-func main() {
-	conn := New("192.168.107.107", "root", "toor", "test")
-	err := conn.Listen(context.TODO(), "xxxxx", []string{"test"}, []Event{INSERT, UPDATE, DELETE, TRUNCATE}, 0, func(lsn pglogrepl.LSN, table string, event Event, newValue map[string]string, oldValue map[string]string) {
-		fmt.Println(table, event, newValue, oldValue)
-	})
-	if err != nil {
-		panic(err)
-	}
+func (conn *Conn) SetEvents(event []Event) {
+	conn.events = event
+}
 
-	fmt.Scanln()
+func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, events []Event, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
+	conn.SetEvents(events)
+	err := conn.connect(ctx)
+	if err != nil {
+		return err
+	}
+	err = conn.SetSlot(ctx, slot)
+	if err != nil {
+		return err
+	}
+	for _, table := range tables {
+		err := conn.SetPublication(ctx, &table)
+		if err != nil {
+			return err
+		}
+	}
+	return conn.Changes(ctx, lsn, handleFunc)
+}
+
+func (conn *Conn) handler(ctx context.Context, handleFunc HandleFunc) {
+	tables := make(map[uint32]string)
+	columns := make(map[uint32][]string)
+	for ctx.Err() == nil {
+		msg, err := conn.replcn.ReceiveMessage(ctx)
+		if err != nil {
+			if pgconn.Timeout(err) {
+				continue
+			}
+			break
+		}
+		copyMsg, ok := msg.(*pgproto3.CopyData)
+		if !ok {
+			continue
+		}
+		if copyMsg.Data[0] != pglogrepl.XLogDataByteID {
+			continue
+		}
+		walLog, err := pglogrepl.ParseXLogData(copyMsg.Data[1:])
+		if err != nil {
+			continue
+		}
+		data, err := pglogrepl.Parse(walLog.WALData)
+		if err != nil {
+			continue
+		}
+		lsn := walLog.WALStart
+
+		switch data := data.(type) {
+		case *pglogrepl.RelationMessage:
+			{
+				tables[data.RelationID] = data.RelationName
+				columns[data.RelationID] = make([]string, 0)
+				for _, column := range data.Columns {
+					columns[data.RelationID] = append(columns[data.RelationID], column.Name)
+				}
+			}
+		case *pglogrepl.InsertMessage:
+			{
+				newValue := make(map[string]string)
+				for index, column := range columns[data.RelationID] {
+					newValue[column] = string(data.Tuple.Columns[index].Data)
+				}
+				handleFunc(lsn, tables[data.RelationID], INSERT, newValue, nil)
+			}
+		case *pglogrepl.UpdateMessage:
+			{
+				oldValue := make(map[string]string)
+				for index, column := range columns[data.RelationID] {
+					oldValue[column] = string(data.OldTuple.Columns[index].Data)
+				}
+				newValue := make(map[string]string)
+				for index, column := range columns[data.RelationID] {
+					newValue[column] = string(data.NewTuple.Columns[index].Data)
+				}
+				handleFunc(lsn, tables[data.RelationID], UPDATE, newValue, oldValue)
+			}
+		case *pglogrepl.DeleteMessage:
+			{
+				oldValue := make(map[string]string)
+				for index, column := range columns[data.RelationID] {
+					oldValue[column] = string(data.OldTuple.Columns[index].Data)
+				}
+				handleFunc(lsn, tables[data.RelationID], DELETE, nil, oldValue)
+			}
+		case *pglogrepl.TruncateMessage:
+			{
+				handleFunc(lsn, tables[data.RelationNum], TRUNCATE, nil, nil)
+			}
+		}
+	}
 }
