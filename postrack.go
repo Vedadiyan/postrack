@@ -14,15 +14,11 @@ import (
 type (
 	Event string
 	Conn  struct {
-		host     string
-		port     int
-		user     string
-		password string
-		database string
-		replcn   *pgconn.PgConn
-		cn       *pgxpool.Pool
-		slot     string
-		events   []Event
+		dsn    string
+		replcn *pgconn.PgConn
+		cn     *pgxpool.Pool
+		slot   string
+		events []Event
 	}
 	Table struct {
 		Name      string
@@ -40,12 +36,6 @@ const (
 	DELETE   Event = "DELETE"
 	TRUNCATE Event = "TRUNCATE"
 )
-
-func WithPort(port int) ConnOption {
-	return func(c *Conn) {
-		c.port = port
-	}
-}
 
 func WithSelector(fields ...string) TableOption {
 	return func(t *Table) {
@@ -69,13 +59,9 @@ func CreatePublicationId(name string) string {
 	return fmt.Sprintf("publication_%s", name)
 }
 
-func New(host string, username string, password string, database string, opts ...ConnOption) *Conn {
+func New(dsn string, opts ...ConnOption) *Conn {
 	conn := new(Conn)
-	conn.port = 5432
-	conn.host = host
-	conn.user = username
-	conn.password = password
-	conn.database = database
+	conn.dsn = dsn
 	for _, opt := range opts {
 		opt(conn)
 	}
@@ -92,12 +78,7 @@ func NewTable(name string, opts ...TableOption) *Table {
 }
 
 func (conn *Conn) connect(ctx context.Context) error {
-	replcn, err := pgconn.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", conn.user, conn.password, conn.host, conn.port, conn.database))
-	if err != nil {
-		return err
-	}
-	conn.replcn = replcn
-	config, err := pgxpool.ParseConfig(fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", conn.host, conn.port, conn.user, conn.password, conn.database))
+	config, err := pgxpool.ParseConfig(conn.dsn)
 	if err != nil {
 		return err
 	}
@@ -108,6 +89,11 @@ func (conn *Conn) connect(ctx context.Context) error {
 		return err
 	}
 	conn.cn = pool
+	replcn, err := pgconn.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", config.ConnConfig.User, config.ConnConfig.Password, config.ConnConfig.Host, config.ConnConfig.Port, config.ConnConfig.Database))
+	if err != nil {
+		return err
+	}
+	conn.replcn = replcn
 	return nil
 }
 
