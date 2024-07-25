@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/jackc/pglogrepl"
-	pgx "github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type (
@@ -20,7 +20,7 @@ type (
 		password     string
 		database     string
 		replcn       *pgconn.PgConn
-		cn           *pgx.Conn
+		cn           *pgxpool.Pool
 		publications map[string]bool
 		slot         string
 	}
@@ -70,11 +70,17 @@ func (conn *Conn) connect(ctx context.Context) error {
 		return err
 	}
 	conn.replcn = replcn
-	cn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", conn.host, conn.port, conn.user, conn.password, conn.database))
+	config, err := pgxpool.ParseConfig(fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", conn.host, conn.port, conn.user, conn.password, conn.database))
 	if err != nil {
 		return err
 	}
-	conn.cn = cn
+	config.MaxConns = 5
+	config.MinConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return err
+	}
+	conn.cn = pool
 	return nil
 }
 
@@ -157,12 +163,7 @@ func (conn *Conn) ReplacePublication(ctx context.Context, table *Table) error {
 	if err != nil {
 		return err
 	}
-	id := CreatePublicationId(table.Name)
-	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", id)).ReadAll()
-	if err != nil {
-		return err
-	}
-	return nil
+	return conn.AddPublication(ctx, table)
 }
 
 func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
@@ -194,6 +195,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 	for key := range conn.publications {
 		publications = append(publications, key)
 	}
+	publicationsStr := strings.Join(publications, ",")
 	err := pglogrepl.StartReplication(
 		ctx,
 		conn.replcn,
@@ -202,7 +204,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '2'",
-				fmt.Sprintf("publication_names '%s'", strings.Join(publications, ",")),
+				fmt.Sprintf("publication_names '%s'", publicationsStr),
 			},
 		},
 	)
@@ -214,12 +216,16 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 }
 
 func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
-	err := conn.AddSlot(ctx, slot)
+	err := conn.connect(ctx)
+	if err != nil {
+		return err
+	}
+	err = conn.AddSlot(ctx, slot)
 	if err != nil {
 		return err
 	}
 	for _, table := range tables {
-		err := conn.AddPublication(ctx, &table)
+		err := conn.ReplacePublication(ctx, &table)
 		if err != nil {
 			return err
 		}
@@ -302,9 +308,11 @@ func (conn *Conn) handler(ctx context.Context, handleFunc HandleFunc) {
 
 func main() {
 	conn := New("192.168.107.107", "root", "toor", "test")
-	conn.Bootstrap(context.TODO(), "test_slot", []Table{{Name: "test", Events: []Event{INSERT, DELETE, UPDATE, TRUNCATE}}}, 0, func(l pglogrepl.LSN, s string, e Event, m1, m2 map[string]string) {
+	err := conn.Bootstrap(context.TODO(), "test_slot2", []Table{{Name: "test", Events: []Event{INSERT, DELETE, UPDATE, TRUNCATE}}, {Name: "t", Events: []Event{INSERT, DELETE, UPDATE, TRUNCATE}}}, 0, func(l pglogrepl.LSN, s string, e Event, m1, m2 map[string]string) {
 		fmt.Println(s, e, m1, m2)
 	})
-
+	if err != nil {
+		panic(err)
+	}
 	fmt.Scanln()
 }
