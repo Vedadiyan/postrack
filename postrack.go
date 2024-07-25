@@ -1,4 +1,4 @@
-package main
+package postrack
 
 import (
 	"context"
@@ -366,22 +366,4 @@ func (conn *Conn) handler(ctx context.Context, handleFunc HandleFunc) {
 			}
 		}
 	}
-}
-
-func main() {
-	conn := New("192.168.107.107", "root", "toor", "test")
-	err := conn.Bootstrap(context.TODO(), "test_slot1", []Table{{Name: "test"}, {Name: "t"}}, []Event{INSERT}, 0, func(l pglogrepl.LSN, s string, e Event, m1, m2 map[string]string) {
-		fmt.Println("SUPER", s, e, m1, m2)
-	})
-	if err != nil {
-		panic(err)
-	}
-	conn2 := New("192.168.107.107", "root", "toor", "test")
-	err2 := conn2.Bootstrap(context.TODO(), "test_slot3", []Table{{Name: "test"}, {Name: "t"}}, []Event{TRUNCATE}, 0, func(l pglogrepl.LSN, s string, e Event, m1, m2 map[string]string) {
-		fmt.Println("YAHOO", s, e, m1, m2)
-	})
-	if err2 != nil {
-		panic(err2)
-	}
-	fmt.Scanln()
 }
