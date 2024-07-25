@@ -223,12 +223,12 @@ func (conn *Conn) ReplacePublication(ctx context.Context, table *Table) error {
 }
 
 func (conn *Conn) SetSlot(ctx context.Context, slot string) error {
-	conn.slot = slot
 	exists, err := conn.SlotExists(ctx, slot)
 	if err != nil {
 		return err
 	}
 	if exists {
+		conn.slot = slot
 		return nil
 	}
 	return conn.AddSlot(ctx, slot)
