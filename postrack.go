@@ -26,7 +26,6 @@ type (
 	}
 	Table struct {
 		Name      string
-		Events    []Event
 		Condition string
 	}
 	ConnOption func(*Conn)
@@ -106,6 +105,28 @@ func (conn *Conn) PublicationExists(ctx context.Context, publicationId string) (
 	return false, nil
 }
 
+func (conn *Conn) PublicationTableExists(ctx context.Context, publicationId string, table string) (bool, error) {
+	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_publication_tables WHERE pubname = $1 AND tablename = $2;`, publicationId, table)
+	if err != nil {
+		return false, err
+	}
+	if res.Next() {
+		values, err := res.Values()
+		if err != nil {
+			return false, err
+		}
+		if len(values) == 0 {
+			return false, fmt.Errorf("row contains no result")
+		}
+		result, ok := values[0].(bool)
+		if !ok {
+			return false, fmt.Errorf("expected boolean but found %T", values[0])
+		}
+		return result, nil
+	}
+	return false, nil
+}
+
 func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, error) {
 	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_replication_slots WHERE slot_name = $1;`, publicationId)
 	if err != nil {
@@ -128,18 +149,18 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 	return false, nil
 }
 
-func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
-	id := CreatePublicationId(table.Name)
+func (conn *Conn) AddPublication(ctx context.Context, table *Table, events []Event) error {
+	id := CreatePublicationId(conn.slot)
 	conn.publications[id] = true
 	exists, err := conn.PublicationExists(ctx, id)
 	if err != nil {
 		return err
 	}
 	if exists {
-		return nil
+		return conn.AlterPublication(ctx, table, true)
 	}
 	_events := make([]string, 0)
-	for _, event := range table.Events {
+	for _, event := range events {
 		_events = append(_events, string(event))
 	}
 	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, table.Name, table.Condition, strings.Join(_events, ","))).ReadAll()
@@ -149,8 +170,36 @@ func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
 	return nil
 }
 
+func (conn *Conn) AlterPublication(ctx context.Context, table *Table, override bool) error {
+	id := CreatePublicationId(conn.slot)
+	exists, err := conn.PublicationTableExists(ctx, id, table.Name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if !override {
+			return nil
+		}
+		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", id, table.Name)).ReadAll()
+		if err != nil {
+			return err
+		}
+	}
+	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", id, table.Name)).ReadAll()
+	if err != nil {
+		return err
+	}
+	if len(table.Condition) != 0 {
+		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s SET TABLE %s %s", id, table.Name, table.Condition)).ReadAll()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (conn *Conn) DropPublication(ctx context.Context, table *Table) error {
-	id := CreatePublicationId(table.Name)
+	id := CreatePublicationId(conn.slot)
 	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", id)).ReadAll()
 	if err != nil {
 		return err
@@ -158,12 +207,12 @@ func (conn *Conn) DropPublication(ctx context.Context, table *Table) error {
 	return nil
 }
 
-func (conn *Conn) ReplacePublication(ctx context.Context, table *Table) error {
+func (conn *Conn) ReplacePublication(ctx context.Context, table *Table, events []Event) error {
 	err := conn.DropPublication(ctx, table)
 	if err != nil {
 		return err
 	}
-	return conn.AddPublication(ctx, table)
+	return conn.AddPublication(ctx, table, events)
 }
 
 func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
@@ -195,7 +244,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 	for key := range conn.publications {
 		publications = append(publications, key)
 	}
-	publicationsStr := strings.Join(publications, ",")
+	publicationsStr := publications[0]
 	err := pglogrepl.StartReplication(
 		ctx,
 		conn.replcn,
@@ -215,7 +264,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 	return nil
 }
 
-func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
+func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, events []Event, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
 	err := conn.connect(ctx)
 	if err != nil {
 		return err
@@ -225,7 +274,7 @@ func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, ls
 		return err
 	}
 	for _, table := range tables {
-		err := conn.ReplacePublication(ctx, &table)
+		err := conn.AddPublication(ctx, &table, events)
 		if err != nil {
 			return err
 		}
@@ -308,7 +357,7 @@ func (conn *Conn) handler(ctx context.Context, handleFunc HandleFunc) {
 
 func main() {
 	conn := New("192.168.107.107", "root", "toor", "test")
-	err := conn.Bootstrap(context.TODO(), "test_slot2", []Table{{Name: "test", Events: []Event{INSERT, DELETE, UPDATE, TRUNCATE}}, {Name: "t", Events: []Event{INSERT, DELETE, UPDATE, TRUNCATE}}}, 0, func(l pglogrepl.LSN, s string, e Event, m1, m2 map[string]string) {
+	err := conn.Bootstrap(context.TODO(), "test_slot0", []Table{{Name: "test"}, {Name: "t"}}, []Event{INSERT, DELETE, UPDATE, TRUNCATE}, 0, func(l pglogrepl.LSN, s string, e Event, m1, m2 map[string]string) {
 		fmt.Println(s, e, m1, m2)
 	})
 	if err != nil {
