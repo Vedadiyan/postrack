@@ -14,16 +14,15 @@ import (
 type (
 	Event string
 	Conn  struct {
-		host         string
-		port         int
-		user         string
-		password     string
-		database     string
-		replcn       *pgconn.PgConn
-		cn           *pgxpool.Pool
-		publications map[string]bool
-		slot         string
-		events       []Event
+		host     string
+		port     int
+		user     string
+		password string
+		database string
+		replcn   *pgconn.PgConn
+		cn       *pgxpool.Pool
+		slot     string
+		events   []Event
 	}
 	Table struct {
 		Name      string
@@ -57,7 +56,6 @@ func New(host string, username string, password string, database string, opts ..
 	conn.user = username
 	conn.password = password
 	conn.database = database
-	conn.publications = make(map[string]bool)
 	for _, opt := range opts {
 		opt(conn)
 	}
@@ -152,7 +150,6 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 
 func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
 	id := CreatePublicationId(conn.slot)
-	conn.publications[id] = true
 	exists, err := conn.PublicationExists(ctx, id)
 	if err != nil {
 		return err
@@ -241,11 +238,7 @@ func (conn *Conn) DropSlot(ctx context.Context, slot string) error {
 }
 
 func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
-	publications := make([]string, 0)
-	for key := range conn.publications {
-		publications = append(publications, key)
-	}
-	publicationsStr := publications[0]
+	id := CreatePublicationId(conn.slot)
 	err := pglogrepl.StartReplication(
 		ctx,
 		conn.replcn,
@@ -254,7 +247,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '2'",
-				fmt.Sprintf("publication_names '%s'", publicationsStr),
+				fmt.Sprintf("publication_names '%s'", id),
 			},
 		},
 	)
