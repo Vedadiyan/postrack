@@ -27,6 +27,7 @@ type (
 	Table struct {
 		Name      string
 		Condition string
+		Override  bool
 	}
 	ConnOption func(*Conn)
 	HandleFunc func(pglogrepl.LSN, string, Event, map[string]string, map[string]string)
@@ -151,20 +152,25 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 	return false, nil
 }
 
-func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
+func (conn *Conn) SetPublication(ctx context.Context, table *Table) error {
 	id := CreatePublicationId(conn.slot)
 	exists, err := conn.PublicationExists(ctx, id)
 	if err != nil {
 		return err
 	}
 	if exists {
-		return conn.AlterPublication(ctx, table, true)
+		return conn.AlterPublication(ctx, table, table.Override)
 	}
+	return conn.AddPublication(ctx, table)
+}
+
+func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
+	id := CreatePublicationId(conn.slot)
 	_events := make([]string, 0)
 	for _, event := range conn.events {
 		_events = append(_events, string(event))
 	}
-	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, table.Name, table.Condition, strings.Join(_events, ","))).ReadAll()
+	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, table.Name, table.Condition, strings.Join(_events, ","))).ReadAll()
 	if err != nil {
 		return err
 	}
@@ -276,7 +282,7 @@ func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, ev
 		return err
 	}
 	for _, table := range tables {
-		err := conn.AddPublication(ctx, &table)
+		err := conn.SetPublication(ctx, &table)
 		if err != nil {
 			return err
 		}
