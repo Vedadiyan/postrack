@@ -29,8 +29,9 @@ type (
 		Condition string
 		Override  bool
 	}
-	ConnOption func(*Conn)
-	HandleFunc func(pglogrepl.LSN, string, Event, map[string]string, map[string]string)
+	ConnOption  func(*Conn)
+	TableOption func(*Table)
+	HandleFunc  func(pglogrepl.LSN, string, Event, map[string]string, map[string]string)
 )
 
 const (
@@ -43,6 +44,24 @@ const (
 func WithPort(port int) ConnOption {
 	return func(c *Conn) {
 		c.port = port
+	}
+}
+
+func WithSelector(fields ...string) TableOption {
+	return func(t *Table) {
+		t.Condition = fmt.Sprintf("(%s)", strings.Join(fields, ","))
+	}
+}
+
+func WithCondition(query string) TableOption {
+	return func(t *Table) {
+		t.Condition = fmt.Sprintf("WHERE %s", query)
+	}
+}
+
+func WithOverride() TableOption {
+	return func(t *Table) {
+		t.Override = true
 	}
 }
 
@@ -61,6 +80,15 @@ func New(host string, username string, password string, database string, opts ..
 		opt(conn)
 	}
 	return conn
+}
+
+func NewTable(name string, opts ...TableOption) *Table {
+	table := new(Table)
+	table.Name = name
+	for _, opt := range opts {
+		opt(table)
+	}
+	return table
 }
 
 func (conn *Conn) connect(ctx context.Context) error {
