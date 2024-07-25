@@ -23,6 +23,7 @@ type (
 		cn           *pgxpool.Pool
 		publications map[string]bool
 		slot         string
+		events       []Event
 	}
 	Table struct {
 		Name      string
@@ -149,7 +150,7 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 	return false, nil
 }
 
-func (conn *Conn) AddPublication(ctx context.Context, table *Table, events []Event) error {
+func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
 	id := CreatePublicationId(conn.slot)
 	conn.publications[id] = true
 	exists, err := conn.PublicationExists(ctx, id)
@@ -160,7 +161,7 @@ func (conn *Conn) AddPublication(ctx context.Context, table *Table, events []Eve
 		return conn.AlterPublication(ctx, table, true)
 	}
 	_events := make([]string, 0)
-	for _, event := range events {
+	for _, event := range conn.events {
 		_events = append(_events, string(event))
 	}
 	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, table.Name, table.Condition, strings.Join(_events, ","))).ReadAll()
@@ -207,12 +208,12 @@ func (conn *Conn) DropPublication(ctx context.Context, table *Table) error {
 	return nil
 }
 
-func (conn *Conn) ReplacePublication(ctx context.Context, table *Table, events []Event) error {
+func (conn *Conn) ReplacePublication(ctx context.Context, table *Table) error {
 	err := conn.DropPublication(ctx, table)
 	if err != nil {
 		return err
 	}
-	return conn.AddPublication(ctx, table, events)
+	return conn.AddPublication(ctx, table)
 }
 
 func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
@@ -264,7 +265,12 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 	return nil
 }
 
+func (conn *Conn) SetEvents(event []Event) {
+	conn.events = event
+}
+
 func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, events []Event, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
+	conn.SetEvents(events)
 	err := conn.connect(ctx)
 	if err != nil {
 		return err
@@ -274,7 +280,7 @@ func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, ev
 		return err
 	}
 	for _, table := range tables {
-		err := conn.AddPublication(ctx, &table, events)
+		err := conn.AddPublication(ctx, &table)
 		if err != nil {
 			return err
 		}
