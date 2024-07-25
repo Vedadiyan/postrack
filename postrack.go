@@ -87,6 +87,7 @@ func (conn *Conn) PublicationExists(ctx context.Context, publicationId string) (
 	if err != nil {
 		return false, err
 	}
+	defer res.Close()
 	if res.Next() {
 		values, err := res.Values()
 		if err != nil {
@@ -109,6 +110,7 @@ func (conn *Conn) PublicationTableExists(ctx context.Context, publicationId stri
 	if err != nil {
 		return false, err
 	}
+	defer res.Close()
 	if res.Next() {
 		values, err := res.Values()
 		if err != nil {
@@ -131,6 +133,7 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 	if err != nil {
 		return false, err
 	}
+	defer res.Close()
 	if res.Next() {
 		values, err := res.Values()
 		if err != nil {
