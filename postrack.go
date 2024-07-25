@@ -222,7 +222,7 @@ func (conn *Conn) ReplacePublication(ctx context.Context, table *Table) error {
 	return conn.AddPublication(ctx, table)
 }
 
-func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
+func (conn *Conn) SetSlot(ctx context.Context, slot string) error {
 	conn.slot = slot
 	exists, err := conn.SlotExists(ctx, slot)
 	if err != nil {
@@ -231,7 +231,12 @@ func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
 	if exists {
 		return nil
 	}
-	_, err = pglogrepl.CreateReplicationSlot(ctx, conn.replcn, slot, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
+	return conn.AddSlot(ctx, slot)
+}
+
+func (conn *Conn) AddSlot(ctx context.Context, slot string) error {
+	conn.slot = slot
+	_, err := pglogrepl.CreateReplicationSlot(ctx, conn.replcn, slot, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Temporary: false})
 	if err != nil {
 		return err
 	}
@@ -277,7 +282,7 @@ func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, ev
 	if err != nil {
 		return err
 	}
-	err = conn.AddSlot(ctx, slot)
+	err = conn.SetSlot(ctx, slot)
 	if err != nil {
 		return err
 	}
