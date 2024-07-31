@@ -21,6 +21,7 @@ type (
 		events []Event
 	}
 	Table struct {
+		Schema    string
 		Name      string
 		Condition string
 		Override  bool
@@ -68,8 +69,9 @@ func New(dsn string, opts ...ConnOption) *Conn {
 	return conn
 }
 
-func NewTable(name string, opts ...TableOption) *Table {
+func NewTable(schema string, name string, opts ...TableOption) *Table {
 	table := new(Table)
+	table.Schema = schema
 	table.Name = name
 	for _, opt := range opts {
 		opt(table)
@@ -120,8 +122,8 @@ func (conn *Conn) PublicationExists(ctx context.Context, publicationId string) (
 	return false, nil
 }
 
-func (conn *Conn) PublicationTableExists(ctx context.Context, publicationId string, table string) (bool, error) {
-	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_publication_tables WHERE pubname = $1 AND tablename = $2;`, publicationId, table)
+func (conn *Conn) PublicationTableExists(ctx context.Context, publicationId string, table *Table) (bool, error) {
+	res, err := conn.cn.Query(ctx, `SELECT TRUE as "Exists" FROM pg_publication_tables WHERE pubname = $1 AND schemaname = $2 AND tablename = $3;`, publicationId, table.Schema, table.Name)
 	if err != nil {
 		return false, err
 	}
@@ -168,7 +170,7 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 
 func (conn *Conn) SetPublication(ctx context.Context, table *Table) error {
 	id := CreatePublicationId(conn.slot)
-	exists, err := conn.PublicationExists(ctx, id)
+	exists, err := conn.PublicationTableExists(ctx, id, table)
 	if err != nil {
 		return err
 	}
@@ -184,7 +186,7 @@ func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
 	for _, event := range conn.events {
 		_events = append(_events, string(event))
 	}
-	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, table.Name, table.Condition, strings.Join(_events, ","))).ReadAll()
+	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s %s WITH (publish = '%s');", id, fmt.Sprintf("%s.%s", table.Schema, table.Name), table.Condition, strings.Join(_events, ","))).ReadAll()
 	if err != nil {
 		return err
 	}
@@ -193,25 +195,18 @@ func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
 
 func (conn *Conn) AlterPublication(ctx context.Context, table *Table, override bool) error {
 	id := CreatePublicationId(conn.slot)
-	exists, err := conn.PublicationTableExists(ctx, id, table.Name)
-	if err != nil {
-		return err
-	}
-	if exists {
-		if !override {
-			return nil
-		}
-		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", id, table.Name)).ReadAll()
+	if !override {
+		_, err := conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", id, fmt.Sprintf("%s.%s", table.Schema, table.Name))).ReadAll()
 		if err != nil {
 			return err
 		}
 	}
-	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", id, table.Name)).ReadAll()
+	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", id, fmt.Sprintf("%s.%s", table.Schema, table.Name))).ReadAll()
 	if err != nil {
 		return err
 	}
 	if len(table.Condition) != 0 {
-		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s SET TABLE %s %s", id, table.Name, table.Condition)).ReadAll()
+		_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s SET TABLE %s %s", id, fmt.Sprintf("%s.%s", table.Schema, table.Name), table.Condition)).ReadAll()
 		if err != nil {
 			return err
 		}
