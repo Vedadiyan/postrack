@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -261,24 +262,28 @@ func (conn *Conn) DropSlot(ctx context.Context, slot string) error {
 }
 
 func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
-	id := CreatePublicationId(conn.slot)
-	err := pglogrepl.StartReplication(
-		ctx,
-		conn.replcn,
-		conn.slot,
-		lsn+1,
-		pglogrepl.StartReplicationOptions{
-			PluginArgs: []string{
-				"proto_version '2'",
-				fmt.Sprintf("publication_names '%s'", id),
+	var err error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		id := CreatePublicationId(conn.slot)
+		err = pglogrepl.StartReplication(
+			ctx,
+			conn.replcn,
+			conn.slot,
+			lsn+1,
+			pglogrepl.StartReplicationOptions{
+				PluginArgs: []string{
+					"proto_version '2'",
+					fmt.Sprintf("publication_names '%s'", id),
+				},
 			},
-		},
-	)
-	if err != nil {
-		return err
-	}
-	go conn.handler(ctx, handleFunc)
-	return nil
+		)
+		wg.Done()
+		conn.handler(ctx, handleFunc)
+	}()
+	wg.Wait()
+	return err
 }
 
 func (conn *Conn) SetEvents(event []Event) {
@@ -352,8 +357,10 @@ func (conn *Conn) handler(ctx context.Context, handleFunc HandleFunc) {
 		case *pglogrepl.UpdateMessage:
 			{
 				oldValue := make(map[string]string)
-				for index, column := range columns[data.RelationID] {
-					oldValue[column] = string(data.OldTuple.Columns[index].Data)
+				if data.OldTuple != nil {
+					for index, column := range columns[data.RelationID] {
+						oldValue[column] = string(data.OldTuple.Columns[index].Data)
+					}
 				}
 				newValue := make(map[string]string)
 				for index, column := range columns[data.RelationID] {
