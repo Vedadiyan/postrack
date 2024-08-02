@@ -3,8 +3,10 @@ package postrack
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -20,6 +22,7 @@ type (
 		cn     *pgxpool.Pool
 		slot   string
 		events []Event
+		lsn    pglogrepl.LSN
 	}
 	Table struct {
 		Schema    string
@@ -97,7 +100,20 @@ func (conn *Conn) connect(ctx context.Context) error {
 		return err
 	}
 	conn.replcn = replcn
+	go conn.keepAlive(ctx, 5)
 	return nil
+}
+
+func (conn *Conn) keepAlive(ctx context.Context, intervalSeconds int) {
+	for ctx.Err() == nil {
+		err := pglogrepl.SendStandbyStatusUpdate(context.TODO(), conn.replcn, pglogrepl.StandbyStatusUpdate{
+			WALWritePosition: conn.lsn,
+		})
+		if err != nil {
+			log.Println(err)
+		}
+		<-time.After(time.Second * time.Duration(intervalSeconds))
+	}
 }
 
 func (conn *Conn) PublicationExists(ctx context.Context, publicationId string) (bool, error) {
@@ -261,7 +277,7 @@ func (conn *Conn) DropSlot(ctx context.Context, slot string) error {
 	return nil
 }
 
-func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
+func (conn *Conn) Changes(ctx context.Context, lsn int64, handleFunc HandleFunc) error {
 	var err error
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -271,7 +287,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn pglogrepl.LSN, handleFunc Han
 			ctx,
 			conn.replcn,
 			conn.slot,
-			lsn+1,
+			pglogrepl.LSN(lsn+1),
 			pglogrepl.StartReplicationOptions{
 				PluginArgs: []string{
 					"proto_version '2'",
@@ -290,8 +306,13 @@ func (conn *Conn) SetEvents(event []Event) {
 	conn.events = event
 }
 
-func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, events []Event, lsn pglogrepl.LSN, handleFunc HandleFunc) error {
+func (conn *Conn) SetLSN(lsn int64) {
+	conn.lsn = pglogrepl.LSN(lsn)
+}
+
+func (conn *Conn) Bootstrap(ctx context.Context, slot string, tables []Table, events []Event, lsn int64, handleFunc HandleFunc) error {
 	conn.SetEvents(events)
+	conn.SetLSN(lsn)
 	err := conn.connect(ctx)
 	if err != nil {
 		return err
@@ -336,7 +357,7 @@ func (conn *Conn) handler(ctx context.Context, handleFunc HandleFunc) {
 			continue
 		}
 		lsn := walLog.WALStart
-
+		conn.SetLSN(int64(lsn))
 		switch data := data.(type) {
 		case *pglogrepl.RelationMessage:
 			{
