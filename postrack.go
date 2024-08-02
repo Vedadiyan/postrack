@@ -297,7 +297,7 @@ func (conn *Conn) Changes(ctx context.Context, lsn int64, handleFunc HandleFunc)
 			pglogrepl.LSN(lsn+1),
 			pglogrepl.StartReplicationOptions{
 				PluginArgs: []string{
-					"proto_version '2'",
+					"proto_version '1'",
 					fmt.Sprintf("publication_names '%s'", id),
 				},
 			},
