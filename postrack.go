@@ -187,7 +187,7 @@ func (conn *Conn) SlotExists(ctx context.Context, publicationId string) (bool, e
 
 func (conn *Conn) SetPublication(ctx context.Context, table *Table) error {
 	id := CreatePublicationId(conn.slot)
-	exists, err := conn.PublicationTableExists(ctx, id, table)
+	exists, err := conn.PublicationExists(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -210,15 +210,22 @@ func (conn *Conn) AddPublication(ctx context.Context, table *Table) error {
 	return nil
 }
 
-func (conn *Conn) AlterPublication(ctx context.Context, table *Table, override bool) error {
+func (conn *Conn) AlterPublication(ctx context.Context, table *Table, noOverride bool) error {
 	id := CreatePublicationId(conn.slot)
-	if !override {
+	exists, err := conn.PublicationTableExists(ctx, id, table)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if noOverride {
+			return nil
+		}
 		_, err := conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s", id, fmt.Sprintf("%s.%s", table.Schema, table.Name))).ReadAll()
 		if err != nil {
 			return err
 		}
 	}
-	_, err := conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", id, fmt.Sprintf("%s.%s", table.Schema, table.Name))).ReadAll()
+	_, err = conn.replcn.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", id, fmt.Sprintf("%s.%s", table.Schema, table.Name))).ReadAll()
 	if err != nil {
 		return err
 	}
